@@ -1,0 +1,10 @@
+{
+  "servers": [
+    {
+      "id": "reto-russia-pruebas",
+      "projectId": "reto-russia",
+      "keyHash": "REEMPLAZAR_POR_SHA256_DE_LA_CLAVE_DEL_SERVIDOR",
+      "disabled": false
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!server.cjs
+!docker-start.cjs
+!docker-entrypoint.sh
+!projects.example.json

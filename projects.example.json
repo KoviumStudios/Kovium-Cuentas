@@ -1,0 +1,24 @@
+{
+  "projects": {
+    "kovsafio": {
+      "access": {
+        "mode": "public"
+      }
+    },
+    "kovanila": {
+      "access": {
+        "mode": "public"
+      }
+    },
+    "reto-russia": {
+      "access": {
+        "mode": "discord",
+        "guildId": "1563596146478288896",
+        "roleIds": [
+          "1565851189449597178"
+        ],
+        "members": []
+      }
+    }
+  }
+}
