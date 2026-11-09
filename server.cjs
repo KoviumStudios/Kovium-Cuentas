@@ -57,15 +57,17 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
    sessions[s.id].credentials=seal(value);s.credentials=sessions[s.id].credentials;save();
   }return value.accessToken;
  }
- async function entitlement(s,id){
-  const p=policy(id);if(!p)return {allowed:false,reason:'Esta instancia no está configurada en el servicio de cupos.'};
-  if(p.disabled===true)return {allowed:false,reason:'Esta instancia fue retirada o sus permisos fueron revocados.'};
-  const access=validateAccess(p.access);if(access.mode==='public')return {allowed:true,reason:''};
+ async function entitlement(s,id,attempt=0){
+  const catalog=activeCatalog(),p=catalog?(Object.hasOwn(catalog.projects,id)?catalog.projects[id]:null):policy(id);if(!p)return {allowed:false,reason:catalog?'Esta instancia no está publicada o fue retirada.':'Esta instancia no está configurada en el servicio de cupos.'};
+  if(!catalog&&p.disabled===true)return {allowed:false,reason:'Esta instancia fue retirada o sus permisos fueron revocados.'};
+  const access=validateAccess(p.access||{mode:'public'});if(access.mode==='public')return {allowed:true,reason:''};
+  const policyStamp=catalog?'':JSON.stringify(p);
   if(access.members.includes(s.user.id))return {allowed:true,reason:''};
   if(!access.guildId||!access.roleIds.length)return {allowed:false,reason:'Los cupos de esta instancia todavía no están configurados.'};
   try{
    let member;try{member=await api('https://discord.com/api/v10/users/@me/guilds/'+access.guildId+'/member',{headers:{Authorization:'Bearer '+await userToken(s)}});}catch(e){if(e.status!==401)throw e;member=await api('https://discord.com/api/v10/users/@me/guilds/'+access.guildId+'/member',{headers:{Authorization:'Bearer '+await userToken(s,true)}});}
-   return Array.isArray(member.roles)&&access.roleIds.some(role=>member.roles.includes(role))?{allowed:true,reason:''}:{allowed:false,reason:'Tu cuenta no tiene cupo para esta instancia.'};
+   const result=Array.isArray(member.roles)&&access.roleIds.some(role=>member.roles.includes(role))?{allowed:true,reason:''}:{allowed:false,reason:'Tu cuenta no tiene cupo para esta instancia.'};
+   if(result.allowed){const latest=activeCatalog(),unchanged=catalog?latest===catalog:!latest&&JSON.stringify(policy(id))===policyStamp;if(!unchanged)return attempt<1&&(!catalog||latest)?entitlement(s,id,attempt+1):{allowed:false,reason:'Los permisos cambiaron durante la comprobación. Vuelve a intentarlo.'};}return result;
   }catch(e){if(e.status===403)return {allowed:false,reason:'Debes pertenecer al servidor y tener el rol de cupo.'};throw e;}
  }
  function json(res,status,value){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'});res.end(JSON.stringify(value));}
@@ -122,7 +124,7 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
    let admissionMatch=/^\/v1\/instances\/([a-z0-9-]+)\/admission$/.exec(url.pathname);
    if(req.method==='POST'&&admissionMatch){
     const id=validId(admissionMatch[1]),s=session(req),identity=minecraftIdentity(await body(req)),allowed=await entitlement(s,id);
-    if(!allowed.allowed||!sessions[s.id]||sessions[s.id].expiresAt<=now()||policy(id)?.disabled===true){json(res,403,{allowed:false,error:'no_seat',reason:allowed.reason||'La sesión o la instancia fue revocada.'});return;}
+    if(!allowed.allowed||!sessions[s.id]||sessions[s.id].expiresAt<=now()){json(res,403,{allowed:false,error:'no_seat',reason:allowed.reason||'La sesión o la instancia fue revocada.'});return;}
     const ticket=token(),expiresAt=now()+60000;admissions.set(ticket,{session:s.id,projectId:id,...identity,expiresAt});
     json(res,200,{ticket,expiresAt,projectId:id,...identity});return;
    }
@@ -132,7 +134,7 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
     const t=admissions.get(b.ticket);if(!t||t.projectId!==id||t.expiresAt<=now()||t.minecraftUuid!==identity.minecraftUuid||t.name!==identity.name||!sessions[t.session]||sessions[t.session].expiresAt<=now()){json(res,403,{allowed:false,error:'invalid_admission'});return;}
     // Consume before awaiting Discord: simultaneous redemption cannot reuse it.
     admissions.delete(b.ticket);const s={id:t.session,...sessions[t.session]},allowed=await entitlement(s,id);
-    if(!allowed.allowed||!sessions[t.session]||sessions[t.session].expiresAt<=now()||policy(id)?.disabled===true){json(res,403,{allowed:false,error:'no_seat',reason:allowed.reason||'La sesión o la instancia fue revocada.'});return;}
+    if(!allowed.allowed||!sessions[t.session]||sessions[t.session].expiresAt<=now()){json(res,403,{allowed:false,error:'no_seat',reason:allowed.reason||'La sesión o la instancia fue revocada.'});return;}
     json(res,200,{allowed:true,projectId:id,...identity,nonce:b.nonce,discordId:s.user.id,expiresAt:t.expiresAt});return;
    }
    let match=/^\/v1\/instances\/([a-z0-9-]+)\/grant$/.exec(url.pathname);
