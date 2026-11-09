@@ -1,16 +1,18 @@
 'use strict';
 const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
 const {pipeline}=require('stream/promises');const {Transform}=require('stream');
+const {createCatalogChannel,readCatalogBody}=require('./catalog-channel.cjs');
 const token=()=>crypto.randomBytes(32).toString('base64url');
 const digest=s=>crypto.createHash('sha256').update(s).digest('hex');
 const challenge=s=>crypto.createHash('sha256').update(s).digest('base64url');
 function equal(a,b){return crypto.timingSafeEqual(Buffer.from(digest(String(a))),Buffer.from(digest(String(b))));}
-function createAccessServer(config,{fetchImpl=fetch,now=Date.now}={}){
+function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKey}={}){
  const publicURL=new URL(config.publicURL);if(publicURL.protocol!=='https:'||publicURL.username||publicURL.password||publicURL.pathname!=='/')throw Error('PUBLIC_URL debe ser el origen HTTPS, sin ruta.');
  if(!/^\d{17,20}$/.test(config.discordClientId||'')||!config.discordClientSecret)throw Error('Faltan DISCORD_CLIENT_ID y DISCORD_CLIENT_SECRET.');
  const key=Buffer.from(config.encryptionKey||'','base64');if(key.length!==32)throw Error('SESSION_ENCRYPTION_KEY debe contener 32 bytes en base64.');
  const packRoot=path.resolve(config.packRoot),policiesFile=path.resolve(config.projectsFile),sessionFile=path.resolve(config.sessionFile);
  fs.mkdirSync(packRoot,{recursive:true});fs.mkdirSync(path.dirname(sessionFile),{recursive:true});
+ const catalogChannel=createCatalogChannel({file:config.catalogFile||path.join(path.dirname(sessionFile),'public-catalog.json'),publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8')});
  const oauth=new Map(),handoffs=new Map(),tickets=new Map(),admissions=new Map(),rates=new Map();let sessions={};
  try{sessions=JSON.parse(fs.readFileSync(sessionFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw Error('No se pudo leer la base de sesiones.');}
  const seal=value=>{const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',key,iv),ciphertext=Buffer.concat([cipher.update(JSON.stringify(value)),cipher.final()]);return Buffer.concat([iv,cipher.getAuthTag(),ciphertext]).toString('base64');};
@@ -71,6 +73,12 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now}={}){
    if(req.headers.origin)throw Object.assign(Error('No se permiten peticiones desde páginas web.'),{status:403});
    const ip=req.socket.remoteAddress||'unknown',r=rates.get(ip);if(!r||r.until<now())rates.set(ip,{count:1,until:now()+60000});else if(++r.count>300)throw Object.assign(Error('Demasiadas solicitudes. Inténtalo en un minuto.'),{status:429});
    const url=new URL(req.url,publicURL);if(url.pathname==='/health'){json(res,200,{ok:true});return;}
+   if(req.method==='GET'&&url.pathname==='/v1/catalog'){
+    const value=catalogChannel.read();res.writeHead(200,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store, no-cache, must-revalidate','Pragma':'no-cache','Expires':'0','ETag':'"'+catalogChannel.revision(value)+'"','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'});res.end(JSON.stringify(value));return;
+   }
+   if(req.method==='PUT'&&url.pathname==='/v1/admin/catalog'){
+    admin(req);const value=await readCatalogBody(req),published=catalogChannel.write(value,req.headers['if-match']);json(res,200,{ok:true,revision:published.revision,publishedAt:published.envelope.publishedAt||null});return;
+   }
    if(req.method==='POST'&&url.pathname==='/v1/auth/discord/start'){
     const b=await body(req),redirectUri=loopback(b.redirectUri);if(!/^[A-Za-z0-9_-]{43}$/.test(b.challenge||'')||!/^[A-Za-z0-9_-]{32,128}$/.test(b.state||''))throw Object.assign(Error('Solicitud de conexión no válida.'),{status:400});
     const state=token();oauth.set(state,{challenge:b.challenge,launcherState:b.state,redirectUri,expiresAt:now()+300000});
@@ -126,7 +134,7 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now}={}){
     }
    }
    json(res,404,{error:'not_found'});
-  }catch(e){if(res.headersSent){res.destroy();return;}json(res,e.status||500,{error:e.status?e.message:'El servicio no pudo completar la solicitud.'});}
+  }catch(e){if(res.headersSent){res.destroy();return;}json(res,e.status||500,{error:e.status?e.message:'El servicio no pudo completar la solicitud.',...(e.status===409?{currentRevision:e.currentRevision||null}:{})});}
  }
  const cleaner=setInterval(()=>{const time=now();for(const map of [oauth,handoffs,tickets,admissions])for(const [id,item]of map)if(item.expiresAt<time)map.delete(id);for(const [ip,item]of rates)if(item.until<time)rates.delete(ip);},60000);cleaner.unref();
  const server=http.createServer(handler);server.requestTimeout=600000;server.headersTimeout=15000;server.maxHeadersCount=30;

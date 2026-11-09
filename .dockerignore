@@ -1,6 +1,8 @@
 *
 !Dockerfile
 !server.cjs
+!catalog-channel.cjs
+!catalog-public-key.pem
 !docker-start.cjs
 !docker-entrypoint.sh
 !projects.example.json
