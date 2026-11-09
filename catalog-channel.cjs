@@ -1,5 +1,6 @@
 'use strict';
 const fs=require('fs'),path=require('path'),crypto=require('crypto');
+const {sanitize:sanitizeLauncher}=require('./launcher-design');
 const MAX_CATALOG_BYTES=2*1024*1024;
 const failure=(status,message,extra={})=>Object.assign(Error(message),{status,...extra});
 function canonicalJSON(value){
@@ -7,20 +8,21 @@ function canonicalJSON(value){
  if(Array.isArray(value))return '['+value.map(canonicalJSON).join(',')+']';
  return '{'+Object.keys(value).filter(key=>value[key]!==undefined).sort().map(key=>JSON.stringify(key)+':'+canonicalJSON(value[key])).join(',')+'}';
 }
-function contentRevision(value){return crypto.createHash('sha256').update(canonicalJSON({schemaVersion:2,projects:value.projects,...(value.integrations!==undefined?{integrations:value.integrations}:{})})).digest('hex');}
+function contentRevision(value){return crypto.createHash('sha256').update(canonicalJSON({schemaVersion:2,projects:value.projects,...(value.integrations!==undefined?{integrations:value.integrations}:{}),...(value.launcher!==undefined?{launcher:sanitizeLauncher(value.launcher)}:{})})).digest('hex');}
 function validateEnvelope(value,publicKey){
  if(!value||typeof value!=='object'||Array.isArray(value)||value.schemaVersion!==2||!value.projects||typeof value.projects!=='object'||Array.isArray(value.projects))throw failure(400,'Catálogo no válido.');
  if(typeof value.signedPayload!=='string'||typeof value.signature!=='string'||!value.signedPayload||value.signedPayload.length>MAX_CATALOG_BYTES||!/^[A-Za-z0-9+/]+={0,2}$/.test(value.signedPayload)||!/^[A-Za-z0-9+/]+={0,2}$/.test(value.signature))throw failure(400,'Falta una firma válida del catálogo.');
  const payload=Buffer.from(value.signedPayload,'base64');
  if(!crypto.verify('RSA-SHA256',payload,publicKey,Buffer.from(value.signature,'base64')))throw failure(400,'La firma del catálogo no es válida.');
  let signed;try{signed=JSON.parse(payload.toString('utf8'));}catch{throw failure(400,'El contenido firmado no es JSON válido.');}
- if(signed.schemaVersion!==2||JSON.stringify(signed.projects)!==JSON.stringify(value.projects)||JSON.stringify(signed.integrations)!==JSON.stringify(value.integrations)||signed.revision!==value.revision||signed.publishedAt!==value.publishedAt)throw failure(400,'El catálogo fue modificado después de firmarlo.');
+ if(signed.schemaVersion!==2||JSON.stringify(signed.projects)!==JSON.stringify(value.projects)||JSON.stringify(signed.integrations)!==JSON.stringify(value.integrations)||JSON.stringify(signed.launcher)!==JSON.stringify(value.launcher)||signed.revision!==value.revision||signed.publishedAt!==value.publishedAt)throw failure(400,'El catálogo fue modificado después de firmarlo.');
+ if(value.launcher!==undefined)try{sanitizeLauncher(value.launcher);}catch(error){throw failure(400,error.message);}
  if(value.integrations!==undefined&&(!value.integrations||typeof value.integrations!=='object'||Array.isArray(value.integrations)))throw failure(400,'Conexiones del catálogo no válidas.');
  if(value.revision!==undefined||value.publishedAt!==undefined){
   if(!/^[a-f0-9]{64}$/.test(value.revision||'')||typeof value.publishedAt!=='string'||!Number.isFinite(Date.parse(value.publishedAt)))throw failure(400,'Los datos de publicación no son válidos.');
   if(contentRevision(value)!==value.revision)throw failure(400,'La revisión no coincide con el catálogo firmado.');
  }
- return {schemaVersion:2,projects:value.projects,...(value.integrations!==undefined?{integrations:value.integrations}:{}),...(value.revision!==undefined?{revision:value.revision,publishedAt:value.publishedAt}:{}),signedPayload:value.signedPayload,signature:value.signature};
+ return {schemaVersion:2,projects:value.projects,...(value.integrations!==undefined?{integrations:value.integrations}:{}),...(value.launcher!==undefined?{launcher:value.launcher}:{}),...(value.revision!==undefined?{revision:value.revision,publishedAt:value.publishedAt}:{}),signedPayload:value.signedPayload,signature:value.signature};
 }
 function readCatalogBody(req){
  return new Promise((resolve,reject)=>{

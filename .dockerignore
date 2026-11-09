@@ -3,6 +3,7 @@
 !server.cjs
 !catalog-channel.cjs
 !catalog-public-key.pem
+!launcher-design.js
 !docker-start.cjs
 !docker-entrypoint.sh
 !projects.example.json

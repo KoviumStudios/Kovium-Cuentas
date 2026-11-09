@@ -6,7 +6,7 @@ ENV NODE_ENV=production PORT=8787 BIND_HOST=0.0.0.0 \
 
 WORKDIR /app
 RUN apk add --no-cache su-exec && mkdir -p /data/packs && chown node:node /data /data/packs
-COPY --chown=node:node server.cjs catalog-channel.cjs catalog-public-key.pem docker-start.cjs projects.example.json ./
+COPY --chown=node:node server.cjs catalog-channel.cjs catalog-public-key.pem launcher-design.js docker-start.cjs projects.example.json ./
 COPY docker-entrypoint.sh /usr/local/bin/kovium-entrypoint
 RUN chmod 0555 /usr/local/bin/kovium-entrypoint
 USER node
