@@ -2,6 +2,7 @@
 const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
 const {pipeline}=require('stream/promises');
 const {createCatalogChannel,readCatalogBody}=require('./catalog-channel.cjs');
+const {createDesktopUpdate}=require('./desktop-update.cjs');
 const token=()=>crypto.randomBytes(32).toString('base64url');
 const digest=s=>crypto.createHash('sha256').update(s).digest('hex');
 const challenge=s=>crypto.createHash('sha256').update(s).digest('base64url');
@@ -22,12 +23,14 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
  const key=Buffer.from(config.encryptionKey||'','base64');if(key.length!==32)throw Error('SESSION_ENCRYPTION_KEY debe contener 32 bytes en base64.');
  const packRoot=path.resolve(config.packRoot),policiesFile=path.resolve(config.projectsFile),sessionFile=path.resolve(config.sessionFile);
  fs.mkdirSync(packRoot,{recursive:true});fs.mkdirSync(path.dirname(sessionFile),{recursive:true});
+ const desktopUpdates=createDesktopUpdate({file:path.join(path.dirname(sessionFile),'desktop-update.json'),publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8')});
  const catalogFile=config.catalogFile||path.join(path.dirname(sessionFile),'public-catalog.json'),catalogChannel=createCatalogChannel({file:catalogFile,publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8')});let catalogCache=null;
- const oauth=new Map(),handoffs=new Map(),tickets=new Map(),admissions=new Map(),rates=new Map(),activeDownloads=new Map();let sessions={};
+ const oauth=new Map(),handoffs=new Map(),tickets=new Map(),admissions=new Map(),rates=new Map(),activeDownloads=new Map(),tokenRefreshes=new Map();let sessions={};
+ const sessionIdleMs=30*86400000,sessionAbsoluteMs=90*86400000;
  try{sessions=JSON.parse(fs.readFileSync(sessionFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw Error('No se pudo leer la base de sesiones.');}
  const seal=value=>{const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',key,iv),ciphertext=Buffer.concat([cipher.update(JSON.stringify(value)),cipher.final()]);return Buffer.concat([iv,cipher.getAuthTag(),ciphertext]).toString('base64');};
  const open=value=>{const b=Buffer.from(value,'base64'),cipher=crypto.createDecipheriv('aes-256-gcm',key,b.subarray(0,12));cipher.setAuthTag(b.subarray(12,28));return JSON.parse(Buffer.concat([cipher.update(b.subarray(28)),cipher.final()]));};
- function save(){fs.writeFileSync(sessionFile+'.tmp',JSON.stringify(sessions),{mode:0o600});fs.renameSync(sessionFile+'.tmp',sessionFile);}
+ function save(){let fd;try{fd=fs.openSync(sessionFile+'.tmp','w',0o600);fs.writeFileSync(fd,JSON.stringify(sessions));fs.fsyncSync(fd);}finally{if(fd!==undefined)fs.closeSync(fd);}fs.renameSync(sessionFile+'.tmp',sessionFile);}
  function readPolicies(){try{const value=JSON.parse(fs.readFileSync(policiesFile,'utf8'));if(!value.projects||typeof value.projects!=='object'||Array.isArray(value.projects))throw Error();return value;}catch(e){if(e.code==='ENOENT')return {projects:{}};throw Error('No se pudo leer la política de cupos.');}}
  function writePolicies(value){fs.mkdirSync(path.dirname(policiesFile),{recursive:true});fs.writeFileSync(policiesFile+'.tmp',JSON.stringify(value,null,2));fs.renameSync(policiesFile+'.tmp',policiesFile);}
  function validId(id){if(!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)||id.length>80)throw Object.assign(Error('Instancia no válida.'),{status:400});return id;}
@@ -44,18 +47,37 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
  function loopback(value){const u=new URL(value);if(u.protocol!=='http:'||!['localhost','127.0.0.1'].includes(u.hostname)||!u.port||u.pathname!=='/oauth/discord/callback'||u.search||u.hash||u.username||u.password)throw Object.assign(Error('Retorno del launcher no válido.'),{status:400});return u.href;}
  async function api(url,options={}){
   const res=await fetchImpl(url,{...options,signal:AbortSignal.timeout(20000),redirect:'error'});const text=await res.text();if(text.length>1000000)throw Error('Respuesta demasiado grande.');let data;try{data=JSON.parse(text);}catch{throw Error('Discord no devolvió datos válidos.');}
-  if(!res.ok)throw Object.assign(Error('Discord no pudo verificar la cuenta.'),{status:res.status===401?401:res.status===403||res.status===404?403:502});return data;
+  if(!res.ok)throw Object.assign(Error('Discord no pudo verificar la cuenta.'),{status:res.status===401||data.error==='invalid_grant'?401:res.status===403||res.status===404?403:502,code:data.error==='invalid_grant'?'invalid_grant':undefined});return data;
  }
  const discordForm=body=>api('https://discord.com/api/oauth2/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:config.discordClientId,client_secret:config.discordClientSecret,...body}).toString()});
  const publicUser=user=>({id:String(user.id),name:String(user.global_name||user.username||'Discord').slice(0,100)});
- function session(req){const m=/^Bearer ([A-Za-z0-9_-]{40,200})$/.exec(req.headers.authorization||'');const id=m&&digest(m[1]),s=id&&sessions[id];if(!s||s.expiresAt<=now()){if(id&&s){delete sessions[id];save();}throw Object.assign(Error('Conecta Discord para verificar tu cupo.'),{status:401});}return {id,...s};}
+ function session(req){const m=/^Bearer ([A-Za-z0-9_-]{40,200})$/.exec(req.headers.authorization||'');const id=m&&digest(m[1]),s=id&&sessions[id];if(!s||!Number.isSafeInteger(s.expiresAt)||s.expiresAt<=now()||s.createdAt&&s.createdAt+sessionAbsoluteMs<=now()){if(id&&s){delete sessions[id];save();}throw Object.assign(Error('Conecta Discord para verificar tu cupo.'),{status:401});}return {id,...s};}
  async function userToken(s,force=false){
-  let value;try{value=open(s.credentials);}catch{delete sessions[s.id];save();throw Object.assign(Error('Vuelve a conectar Discord.'),{status:401});}
+  const current=sessions[s.id];if(!current)throw Object.assign(Error('La sesión fue desconectada.'),{status:401});
+  if(s.credentials!==current.credentials){s.credentials=current.credentials;force=false;}
+  let value;try{value=open(current.credentials);}catch{delete sessions[s.id];save();throw Object.assign(Error('Vuelve a conectar Discord.'),{status:401});}
   if(force||value.expiresAt<now()+60000){
-   const fresh=await discordForm({grant_type:'refresh_token',refresh_token:value.refreshToken});
-   value={accessToken:fresh.access_token,refreshToken:fresh.refresh_token||value.refreshToken,expiresAt:now()+(Number(fresh.expires_in)||3600)*1000};
-   sessions[s.id].credentials=seal(value);s.credentials=sessions[s.id].credentials;save();
+   if(tokenRefreshes.has(s.id))return tokenRefreshes.get(s.id);
+   const pending=(async()=>{try{
+    const fresh=await discordForm({grant_type:'refresh_token',refresh_token:value.refreshToken});
+    if(typeof fresh.access_token!=='string'||!fresh.access_token||!Number.isFinite(Number(fresh.expires_in))||Number(fresh.expires_in)<=0)throw Object.assign(Error('Discord no devolvió una sesión válida.'),{status:502});
+    value={accessToken:fresh.access_token,refreshToken:fresh.refresh_token||value.refreshToken,expiresAt:now()+Math.min(Number(fresh.expires_in),30*86400)*1000};
+    if(!sessions[s.id])throw Object.assign(Error('La sesión fue desconectada.'),{status:401});
+    sessions[s.id].credentials=seal(value);s.credentials=sessions[s.id].credentials;save();return value.accessToken;
+   }catch(e){if(e.status===401&&sessions[s.id]){delete sessions[s.id];save();}throw e;}})().finally(()=>tokenRefreshes.delete(s.id));
+   tokenRefreshes.set(s.id,pending);return pending;
   }return value.accessToken;
+ }
+ async function renewSession(s){
+  // Revalidate with Discord before extending a remembered login. Outages never
+  // revoke a valid cached session; refresh-token revocation does.
+  if(!s.verifiedAt||s.verifiedAt<now()-86400000){
+   let user;try{user=await api('https://discord.com/api/v10/users/@me',{headers:{Authorization:'Bearer '+await userToken(s)}});}catch(e){if(e.status!==401||!sessions[s.id])throw e;user=await api('https://discord.com/api/v10/users/@me',{headers:{Authorization:'Bearer '+await userToken(s,true)}});}
+   if(user.id!==s.user.id)throw Object.assign(Error('Discord devolvió otra cuenta. Vuelve a conectar.'),{status:401});
+   if(!sessions[s.id])throw Object.assign(Error('La sesión fue desconectada.'),{status:401});
+   const current=sessions[s.id];current.user=publicUser(user);current.createdAt=current.createdAt||now();current.verifiedAt=now();current.expiresAt=Math.min(now()+sessionIdleMs,current.createdAt+sessionAbsoluteMs);save();
+  }
+  return sessions[s.id];
  }
  async function entitlement(s,id,attempt=0){
   const catalog=activeCatalog(),p=catalog?(Object.hasOwn(catalog.projects,id)?catalog.projects[id]:null):policy(id);if(!p)return {allowed:false,reason:catalog?'Esta instancia no está publicada o fue retirada.':'Esta instancia no está configurada en el servicio de cupos.'};
@@ -97,6 +119,8 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
     rate(ip,'catalog',6000);const value=catalogResponse();res.writeHead(200,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store, no-cache, must-revalidate','Pragma':'no-cache','Expires':'0','ETag':'"'+value.revision+'"','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'});res.end(value.body);return;
    }
    rate(ip,'accounts',300);
+   if(req.method==='GET'&&url.pathname==='/v1/desktop-update'){json(res,200,desktopUpdates.get(req.headers.authorization));return;}
+   if(req.method==='PUT'&&url.pathname==='/v1/admin/desktop-update'){admin(req);json(res,200,desktopUpdates.write(await body(req)));return;}
    if(req.method==='GET'&&url.pathname==='/v1/admin/storage'){admin(req);pruneStages();packStorage.sweep();json(res,200,packStorage.status());return;}
    if(req.method==='PUT'&&url.pathname==='/v1/admin/catalog'){
     admin(req);const value=await readCatalogBody(req);validateCatalogPacks(value);const published=catalogChannel.write(value,req.headers['if-match']);catalogCache=null;json(res,200,{ok:true,revision:published.revision,publishedAt:published.envelope.publishedAt||null});return;
@@ -116,9 +140,9 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
    }
    if(req.method==='POST'&&url.pathname==='/v1/auth/discord/exchange'){
     const b=await body(req),handoff=handoffs.get(b.code);if(!handoff||handoff.expiresAt<now()||!equal(challenge(String(b.verifier||'')),handoff.challenge))throw Object.assign(Error('Conexión no válida o ya utilizada.'),{status:401});handoffs.delete(b.code);
-    const sessionToken=token(),expiresAt=now()+7*86400000;sessions[digest(sessionToken)]={user:handoff.user,credentials:seal(handoff.credentials),expiresAt};save();json(res,200,{sessionToken,user:handoff.user,expiresAt});return;
+    const sessionToken=token(),expiresAt=now()+sessionIdleMs;sessions[digest(sessionToken)]={user:handoff.user,credentials:seal(handoff.credentials),createdAt:now(),verifiedAt:now(),expiresAt};save();json(res,200,{sessionToken,user:handoff.user,expiresAt});return;
    }
-   if(req.method==='GET'&&url.pathname==='/v1/session'){const s=session(req);json(res,200,{user:s.user,expiresAt:s.expiresAt});return;}
+   if(req.method==='GET'&&url.pathname==='/v1/session'){const s=await renewSession(session(req));if(!s)throw Object.assign(Error('La sesión fue desconectada.'),{status:401});json(res,200,{user:s.user,expiresAt:s.expiresAt});return;}
    if(req.method==='POST'&&url.pathname==='/v1/session/revoke'){const s=session(req);delete sessions[s.id];for(const map of [tickets,admissions])for(const [id,t]of map)if(t.session===s.id)map.delete(id);save();json(res,200,{ok:true});return;}
    if(req.method==='POST'&&url.pathname==='/v1/access/check'){const b=await body(req);json(res,200,await entitlement(session(req),validId(String(b.projectId||''))));return;}
    let admissionMatch=/^\/v1\/instances\/([a-z0-9-]+)\/admission$/.exec(url.pathname);
