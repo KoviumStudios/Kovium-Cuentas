@@ -4,6 +4,9 @@
 !catalog-channel.cjs
 !desktop-update.cjs
 !admin-access.cjs
+!kovium-accounts.cjs
+!account-skin.cjs
+!public-info.cjs
 !runner-leaderboard.cjs
 !runner-model.js
 !catalog-public-key.pem

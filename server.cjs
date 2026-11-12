@@ -5,6 +5,9 @@ const {createCatalogChannel,readCatalogBody}=require('./catalog-channel.cjs');
 const {createDesktopUpdate}=require('./desktop-update.cjs');
 const {createAdminAccess}=require('./admin-access.cjs');
 const {createRunnerLeaderboard,readRunnerBody}=require('./runner-leaderboard.cjs');
+const {createKoviumAccounts}=require('./kovium-accounts.cjs');
+const {publicInfo}=require('./public-info.cjs');
+const {isIP}=require('net');
 const token=()=>crypto.randomBytes(32).toString('base64url');
 const digest=s=>crypto.createHash('sha256').update(s).digest('hex');
 const challenge=s=>crypto.createHash('sha256').update(s).digest('base64url');
@@ -19,7 +22,7 @@ function createPackStorage({root,referenced=()=>[],maxPackBytes=256*1024*1024,to
  return {status,begin,sweep};
 }
 async function receivePack(req,file,maxBytes,hash){let fd,size=0;try{fd=fs.openSync(file,'wx',0o600);for await(const chunk of req.iterator({destroyOnReturn:false})){size+=chunk.length;if(size>maxBytes)throw Object.assign(Error('El pack supera el espacio privado disponible. Reduce su tamaño.'),{status:413});hash.update(chunk);let offset=0;while(offset<chunk.length){const wrote=fs.writeSync(fd,chunk,offset,chunk.length-offset);if(!wrote)throw Error('No se pudo completar la escritura del pack.');offset+=wrote;}}fs.fsyncSync(fd);return size;}catch(error){req.resume();if(error.code==='ENOSPC'||error.code==='EDQUOT')throw Object.assign(Error('El almacenamiento privado está lleno. El pack actual se conserva.'),{status:413});throw error;}finally{if(fd!==undefined)fs.closeSync(fd);}}
-function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKey}={}){
+function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKey,accountPasswordDerive}={}){
  const publicURL=new URL(config.publicURL);if(publicURL.protocol!=='https:'||publicURL.username||publicURL.password||publicURL.pathname!=='/')throw Error('PUBLIC_URL debe ser el origen HTTPS, sin ruta.');
  if(!/^\d{17,20}$/.test(config.discordClientId||'')||!config.discordClientSecret)throw Error('Faltan DISCORD_CLIENT_ID y DISCORD_CLIENT_SECRET.');
  const key=Buffer.from(config.encryptionKey||'','base64');if(key.length!==32)throw Error('SESSION_ENCRYPTION_KEY debe contener 32 bytes en base64.');
@@ -28,12 +31,13 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
  const desktopUpdates=createDesktopUpdate({file:path.join(path.dirname(sessionFile),'desktop-update.json'),publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8')});
  const catalogFile=config.catalogFile||path.join(path.dirname(sessionFile),'public-catalog.json'),catalogChannel=createCatalogChannel({file:catalogFile,publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8')});let catalogCache=null;
  const adminPublishing=createAdminAccess({file:path.join(path.dirname(sessionFile),'admin-publisher-sessions.json'),passwordHash:config.adminPasswordHash,githubToken:config.publishGitHubToken,signingKeyBase64:config.publishSigningKeyBase64,publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8'),legacyToken:config.adminToken,fetchImpl,now});
- const runner=createRunnerLeaderboard({file:path.join(path.dirname(sessionFile),'runner-leaderboard.json'),now});
  const oauth=new Map(),handoffs=new Map(),tickets=new Map(),admissions=new Map(),rates=new Map(),activeDownloads=new Map(),tokenRefreshes=new Map();let sessions={};
  const sessionIdleMs=30*86400000,sessionAbsoluteMs=90*86400000;
  try{sessions=JSON.parse(fs.readFileSync(sessionFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw Error('No se pudo leer la base de sesiones.');}
  const seal=value=>{const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',key,iv),ciphertext=Buffer.concat([cipher.update(JSON.stringify(value)),cipher.final()]);return Buffer.concat([iv,cipher.getAuthTag(),ciphertext]).toString('base64');};
  const open=value=>{const b=Buffer.from(value,'base64'),cipher=crypto.createDecipheriv('aes-256-gcm',key,b.subarray(0,12));cipher.setAuthTag(b.subarray(12,28));return JSON.parse(Buffer.concat([cipher.update(b.subarray(28)),cipher.final()]));};
+ const accounts=createKoviumAccounts({file:config.accountsFile||path.join(path.dirname(sessionFile),'accounts.json'),encryptionKey:config.encryptionKey,publicURL:publicURL.origin,googleClientId:config.googleClientId,googleClientSecret:config.googleClientSecret,fetchImpl,now,...(accountPasswordDerive?{deriveKey:accountPasswordDerive}:{}),verifyDiscord:verifyDiscordForAccount,restoreDiscord:restoreAccountDiscord,discordSessionValid:(cached,accountId,familyId,discordId)=>{const s=sessions[digest(cached.sessionToken||'')];return !!s&&s.expiresAt>now()&&s.accountId===accountId&&s.accountFamilyId===familyId&&s.user.id===discordId;},onDiscordLinked:(accountId,proof)=>{const s=sessions[proof.sourceSessionId];if(s&&s.user.id===proof.id){s.linkedAccountId=accountId;s.credentials=proof.credentials;save();}},revokeDiscord:revokeAccountDiscord});
+ const runner=createRunnerLeaderboard({file:path.join(path.dirname(sessionFile),'runner-leaderboard.json'),now,profileForAccount:id=>accounts.profileById(id),signingKeyBase64:config.publishSigningKeyBase64,publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8')});
  function save(){let fd;try{fd=fs.openSync(sessionFile+'.tmp','w',0o600);fs.writeFileSync(fd,JSON.stringify(sessions));fs.fsyncSync(fd);}finally{if(fd!==undefined)fs.closeSync(fd);}fs.renameSync(sessionFile+'.tmp',sessionFile);}
  function readPolicies(){try{const value=JSON.parse(fs.readFileSync(policiesFile,'utf8'));if(!value.projects||typeof value.projects!=='object'||Array.isArray(value.projects))throw Error();return value;}catch(e){if(e.code==='ENOENT')return {projects:{}};throw Error('No se pudo leer la política de cupos.');}}
  function writePolicies(value){fs.mkdirSync(path.dirname(policiesFile),{recursive:true});fs.writeFileSync(policiesFile+'.tmp',JSON.stringify(value,null,2));fs.renameSync(policiesFile+'.tmp',policiesFile);}
@@ -58,19 +62,40 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
  function session(req){const m=/^Bearer ([A-Za-z0-9_-]{40,200})$/.exec(req.headers.authorization||'');const id=m&&digest(m[1]),s=id&&sessions[id];if(!s||!Number.isSafeInteger(s.expiresAt)||s.expiresAt<=now()||s.createdAt&&s.createdAt+sessionAbsoluteMs<=now()){if(id&&s){delete sessions[id];save();}throw Object.assign(Error('Conecta Discord para verificar tu cupo.'),{status:401});}return {id,...s};}
  async function userToken(s,force=false){
   const current=sessions[s.id];if(!current)throw Object.assign(Error('La sesión fue desconectada.'),{status:401});
+  const ownerAccount=current.accountId||current.linkedAccountId,provider=ownerAccount&&accounts.discordCredentials(ownerAccount);
+  if(current.accountId&&(!provider||provider.id!==current.user.id)){delete sessions[s.id];save();throw Object.assign(Error('La cuenta Discord fue desvinculada.'),{status:401});}
+  if(provider?.id===current.user.id&&provider.credentials!==current.credentials){current.credentials=provider.credentials;s.credentials=provider.credentials;force=false;save();}
   if(s.credentials!==current.credentials){s.credentials=current.credentials;force=false;}
   let value;try{value=open(current.credentials);}catch{delete sessions[s.id];save();throw Object.assign(Error('Vuelve a conectar Discord.'),{status:401});}
   if(force||value.expiresAt<now()+60000){
-   if(tokenRefreshes.has(s.id))return tokenRefreshes.get(s.id);
-   const pending=(async()=>{try{
+   const refreshKey=provider?'account:'+ownerAccount:s.id;
+   let pending=tokenRefreshes.get(refreshKey);
+   if(!pending){const oldCredentials=current.credentials;pending=(async()=>{
     const fresh=await discordForm({grant_type:'refresh_token',refresh_token:value.refreshToken});
     if(typeof fresh.access_token!=='string'||!fresh.access_token||!Number.isFinite(Number(fresh.expires_in))||Number(fresh.expires_in)<=0)throw Object.assign(Error('Discord no devolvió una sesión válida.'),{status:502});
     value={accessToken:fresh.access_token,refreshToken:fresh.refresh_token||value.refreshToken,expiresAt:now()+Math.min(Number(fresh.expires_in),30*86400)*1000};
-    if(!sessions[s.id])throw Object.assign(Error('La sesión fue desconectada.'),{status:401});
-    sessions[s.id].credentials=seal(value);s.credentials=sessions[s.id].credentials;save();return value.accessToken;
-   }catch(e){if(e.status===401&&sessions[s.id]){delete sessions[s.id];save();}throw e;}})().finally(()=>tokenRefreshes.delete(s.id));
-   tokenRefreshes.set(s.id,pending);return pending;
+    let credentials=seal(value);if(provider&&!accounts.updateDiscordCredentials(ownerAccount,current.user.id,oldCredentials,credentials)){const latest=accounts.discordCredentials(ownerAccount);if(latest?.id===current.user.id)credentials=latest.credentials;}
+    // Retain a rotated provider credential even if the initiating device logged
+    // out during the request. Never recreate its revoked local session.
+    for(const record of Object.values(sessions))if(record.user.id===current.user.id&&(record.credentials===oldCredentials||provider&&record.linkedAccountId===ownerAccount))record.credentials=credentials;
+    if(sessions[s.id])sessions[s.id].credentials=credentials;save();return open(credentials).accessToken;
+   })().finally(()=>tokenRefreshes.delete(refreshKey));tokenRefreshes.set(refreshKey,pending);}
+   try{const result=await pending;const still=sessions[s.id];if(!still||still.expiresAt<=now()||still.accountId&&accounts.discordCredentials(still.accountId)?.id!==still.user.id)throw Object.assign(Error('La sesión fue desconectada.'),{status:401});s.credentials=still.credentials;return result;}
+   catch(error){if(error.status===401&&sessions[s.id]){delete sessions[s.id];save();}throw error;}
   }return value.accessToken;
+ }
+ async function verifyDiscordForAccount(sessionToken){
+  let s;try{if(!/^[A-Za-z0-9_-]{43}$/.test(sessionToken||''))throw Error();s=session({headers:{authorization:'Bearer '+sessionToken}});}catch{throw Object.assign(Error('Vuelve a conectar Discord antes de vincularlo.'),{status:409});}
+  let user;try{try{user=await api('https://discord.com/api/v10/users/@me',{headers:{Authorization:'Bearer '+await userToken(s)}});}catch(error){if(error.status!==401)throw error;user=await api('https://discord.com/api/v10/users/@me',{headers:{Authorization:'Bearer '+await userToken(s,true)}});}}catch(error){if(error.status===401)throw Object.assign(Error('Vuelve a conectar Discord antes de vincularlo.'),{status:409});throw error;}
+  if(user.id!==s.user.id||!sessions[s.id])throw Object.assign(Error('Discord no confirmó al propietario de esta conexión.'),{status:409});return {id:s.user.id,name:publicUser(user).name,credentials:sessions[s.id].credentials,sourceSessionId:s.id};
+ }
+ function revokeAccountDiscord(accountId,familyId,previousProvider){
+  let changed=false;for(const [id,s]of Object.entries(sessions)){if(s.accountId===accountId&&(!familyId||s.accountFamilyId===familyId)){delete sessions[id];changed=true;}else if(previousProvider&&s.linkedAccountId===accountId){s.credentials=previousProvider.credentials;delete s.linkedAccountId;changed=true;}}if(changed)save();
+ }
+ async function restoreAccountDiscord(accountId,familyId,provider){
+  const value=token(),id=digest(value),expiresAt=now()+sessionIdleMs;sessions[id]={user:{id:provider.id,name:provider.name},credentials:provider.credentials,createdAt:now(),verifiedAt:0,expiresAt,accountId,accountFamilyId:familyId};save();
+  try{const user=await api('https://discord.com/api/v10/users/@me',{headers:{Authorization:'Bearer '+await userToken({id,...sessions[id]})}});if(user.id!==provider.id)throw Object.assign(Error('Discord devolvió otra cuenta.'),{status:401});if(!sessions[id])throw Object.assign(Error('La conexión fue revocada.'),{status:401});sessions[id].user=publicUser(user);sessions[id].verifiedAt=now();save();return {sessionToken:value,user:sessions[id].user,expiresAt};}
+  catch(error){if(sessions[id]){delete sessions[id];save();}if(error.status===401)return {connected:false,needsReconnect:true,reason:'Vuelve a conectar Discord para restaurar sus permisos.'};throw Object.assign(Error('Discord no está disponible temporalmente. Tu cuenta Kovium sigue conectada.'),{status:503});}
  }
  async function renewSession(s){
   // Revalidate with Discord before extending a remembered login. Outages never
@@ -118,11 +143,13 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
  async function handler(req,res){
   try{
    if(req.headers.origin)throw Object.assign(Error('No se permiten peticiones desde páginas web.'),{status:403});
-   const url=new URL(req.url,publicURL),ip=req.socket.remoteAddress||'unknown';if(req.method==='GET'&&url.pathname==='/health'){json(res,200,{ok:true});return;}
+   const url=new URL(req.url,publicURL);let ip=req.socket.remoteAddress||'unknown';if(config.trustProxy==='railway'){const real=String(req.headers['x-real-ip']||'').trim();if(isIP(real))ip=real;}else if(config.trustProxy===true||config.trustProxy==='1'){const forwarded=String(req.headers['x-forwarded-for']||'').split(',').map(x=>x.trim()),last=forwarded.at(-1);if(isIP(last))ip=last;}if(req.method==='GET'&&url.pathname==='/health'){json(res,200,{ok:true});return;}
+   if(publicInfo(req,res,url))return;
    if(await adminPublishing.handle(req,res,url,ip))return;
-   if(req.method==='GET'&&url.pathname==='/v1/runner/leaderboard'){rate(ip,'runner',180);let s;try{s=session(req);}catch(error){if(error.status!==401)throw error;}json(res,200,await runner.get(s));return;}
-   if(req.method==='POST'&&url.pathname==='/v1/runner/start'){rate(ip,'runner',30);json(res,200,await runner.start(session(req)));return;}
-   if(req.method==='POST'&&url.pathname==='/v1/runner/submit'){rate(ip,'runner',30);const s=session(req);json(res,200,await runner.submit(s,await readRunnerBody(req)));return;}
+   if(await accounts.handle(req,res,url,ip))return;
+   if(req.method==='GET'&&url.pathname==='/v1/runner/leaderboard'){rate(ip,'runner',180);json(res,200,await runner.get(accounts.auth(req,true)));return;}
+   if(req.method==='POST'&&url.pathname==='/v1/runner/start'){rate(ip,'runner',30);json(res,200,await runner.start(accounts.auth(req)));return;}
+   if(req.method==='POST'&&url.pathname==='/v1/runner/submit'){rate(ip,'runner',30);const s=accounts.auth(req);json(res,200,await runner.submit(s,await readRunnerBody(req)));return;}
    if(req.method==='GET'&&url.pathname==='/v1/catalog'){
     rate(ip,'catalog',6000);const value=catalogResponse();res.writeHead(200,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store, no-cache, must-revalidate','Pragma':'no-cache','Expires':'0','ETag':'"'+value.revision+'"','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'});res.end(value.body);return;
    }
@@ -203,12 +230,12 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
     }
    }
    json(res,404,{error:'not_found'});
-  }catch(e){if(res.headersSent){res.destroy();return;}json(res,e.status||500,{error:e.status?e.message:'El servicio no pudo completar la solicitud.',...(e.status===409?{currentRevision:e.currentRevision||null}:{})});}
+  }catch(e){if(res.headersSent){res.destroy();return;}json(res,e.status||500,{error:e.status?e.message:'El servicio no pudo completar la solicitud.',...(e.code&&e.status&&/^[a-z_]{3,64}$/.test(e.code)?{code:e.code}:{}),...(e.status===409?{currentRevision:e.currentRevision||null}:{})});}
  }
- const cleaner=setInterval(()=>{const time=now();for(const map of [oauth,handoffs,tickets,admissions])for(const [id,item]of map)if(item.expiresAt<time)map.delete(id);for(const [ip,item]of rates)if(item.until<time)rates.delete(ip);try{pruneStages();packStorage.sweep();adminPublishing.sweep();runner.prune();}catch{}},60000);cleaner.unref();
+ const cleaner=setInterval(()=>{const time=now();for(const map of [oauth,handoffs,tickets,admissions])for(const [id,item]of map)if(item.expiresAt<time)map.delete(id);for(const [ip,item]of rates)if(item.until<time)rates.delete(ip);try{pruneStages();packStorage.sweep();adminPublishing.sweep();runner.prune();accounts.prune();}catch{}},60000);cleaner.unref();
  const server=http.createServer(handler);server.requestTimeout=30*60000;server.headersTimeout=15000;server.maxHeadersCount=30;
  server.once('close',()=>clearInterval(cleaner));return server;
 }
-function environment(env=process.env){const base=path.resolve(__dirname,'private');return {publicURL:env.PUBLIC_URL,discordClientId:env.DISCORD_CLIENT_ID,discordClientSecret:env.DISCORD_CLIENT_SECRET,encryptionKey:env.SESSION_ENCRYPTION_KEY,adminToken:env.ADMIN_TOKEN,adminPasswordHash:env.ADMIN_PASSWORD_HASH,publishGitHubToken:env.PUBLISH_GITHUB_TOKEN,publishSigningKeyBase64:env.PUBLISH_SIGNING_KEY_PEM_B64,packRoot:env.PACK_ROOT||path.join(base,'packs'),projectsFile:env.PROJECTS_FILE||path.join(base,'projects.json'),sessionFile:env.SESSION_FILE||path.join(base,'sessions.json'),serverKeysFile:env.SERVER_KEYS_FILE||path.join(base,'server-keys.json'),...(env.PACK_STORAGE_BUDGET_BYTES?{packStorageBudgetBytes:env.PACK_STORAGE_BUDGET_BYTES}:{}),...(env.PACK_MAX_UPLOAD_BYTES?{maxPackBytes:env.PACK_MAX_UPLOAD_BYTES}:{}),...(env.PACK_DISK_RESERVE_BYTES?{packDiskReserveBytes:env.PACK_DISK_RESERVE_BYTES}:{})};}
+function environment(env=process.env){const base=path.resolve(__dirname,'private');return {publicURL:env.PUBLIC_URL,discordClientId:env.DISCORD_CLIENT_ID,discordClientSecret:env.DISCORD_CLIENT_SECRET,encryptionKey:env.SESSION_ENCRYPTION_KEY,adminToken:env.ADMIN_TOKEN,adminPasswordHash:env.ADMIN_PASSWORD_HASH,publishGitHubToken:env.PUBLISH_GITHUB_TOKEN,publishSigningKeyBase64:env.PUBLISH_SIGNING_KEY_PEM_B64,googleClientId:env.GOOGLE_CLIENT_ID,googleClientSecret:env.GOOGLE_CLIENT_SECRET,trustProxy:env.TRUST_PROXY||false,accountsFile:env.ACCOUNTS_FILE,packRoot:env.PACK_ROOT||path.join(base,'packs'),projectsFile:env.PROJECTS_FILE||path.join(base,'projects.json'),sessionFile:env.SESSION_FILE||path.join(base,'sessions.json'),serverKeysFile:env.SERVER_KEYS_FILE||path.join(base,'server-keys.json'),...(env.PACK_STORAGE_BUDGET_BYTES?{packStorageBudgetBytes:env.PACK_STORAGE_BUDGET_BYTES}:{}),...(env.PACK_MAX_UPLOAD_BYTES?{maxPackBytes:env.PACK_MAX_UPLOAD_BYTES}:{}),...(env.PACK_DISK_RESERVE_BYTES?{packDiskReserveBytes:env.PACK_DISK_RESERVE_BYTES}:{})};}
 if(require.main===module){try{const server=createAccessServer(environment());server.listen(Number(process.env.PORT)||8787,process.env.BIND_HOST||'127.0.0.1',()=>console.log('Servicio de cupos listo en el puerto '+server.address().port));}catch(e){console.error(e.message);process.exitCode=1;}}
 module.exports={createAccessServer,createPackStorage,environment,challenge,digest};

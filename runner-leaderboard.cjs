@@ -4,49 +4,58 @@ const fail=(message,status=400)=>Object.assign(Error(message),{status});
 const hash=value=>crypto.createHash('sha256').update(value).digest('hex');
 const ACTIONS=new Set(['left','right','jump','duck']);
 const MAX_TICKS=108000,MAX_INPUTS=12000;
+function verifySeasonDescriptor(value,publicKey,expectedModelVersion){
+ if(!value||value.schemaVersion!==2||value.game!=='run-kovi-run'||!/^[a-f0-9]{64}$/.test(value.modelVersion||'')||value.season!=='accounts-v2-'+value.modelVersion.slice(0,16)||typeof value.signedPayload!=='string'||value.signedPayload.length>4000||typeof value.signature!=='string')throw fail('La temporada no supera la comprobación.');
+ const payload=Buffer.from(value.signedPayload,'base64');let signed;try{if(!crypto.verify('RSA-SHA256',payload,publicKey,Buffer.from(value.signature,'base64')))throw Error();signed=JSON.parse(payload);}catch{throw fail('La firma de la temporada no es válida.');}
+ if(signed.schemaVersion!==value.schemaVersion||signed.game!==value.game||signed.season!==value.season||signed.modelVersion!==value.modelVersion||expectedModelVersion&&value.modelVersion!==expectedModelVersion)throw fail('La temporada corresponde a otra versión del juego.');return true;
+}
 async function readRunnerBody(req){
  const chunks=[];let bytes=0;
  for await(const chunk of req){bytes+=chunk.length;if(bytes>850000)throw fail('La partida supera el límite permitido.',413);chunks.push(chunk);}
  let value;try{value=JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw fail('Partida no válida.');}
  if(!value||typeof value!=='object'||Array.isArray(value))throw fail('Partida no válida.');return value;
 }
-function createRunnerLeaderboard({file,now=Date.now,modelFactory,maxEntries=10000}={}){
+function createRunnerLeaderboard({file,now=Date.now,modelFactory,maxEntries=10000,profileForAccount=()=>null,signingKeyBase64,publicKey}={}){
  if(!file)throw Error('Falta el archivo de clasificación.');
  const tickets=new Map(),rates=new Map();let records=new Map();
+ const modelVersion=hash(fs.readFileSync(path.join(__dirname,'runner-model.js'))),season='accounts-v2-'+modelVersion.slice(0,16),seasonPayload={schemaVersion:2,game:'run-kovi-run',season,modelVersion};let seasonDescriptor={...seasonPayload},rankedReady=false;
+ try{if(signingKeyBase64){const key=crypto.createPrivateKey(Buffer.from(signingKeyBase64,'base64'));const payload=Buffer.from(JSON.stringify(seasonPayload)),signature=crypto.sign('RSA-SHA256',payload,key).toString('base64');if(publicKey&&!crypto.verify('RSA-SHA256',payload,publicKey,Buffer.from(signature,'base64')))throw Error();seasonDescriptor={...seasonPayload,signedPayload:payload.toString('base64'),signature};rankedReady=true;}}catch{}
  try{
   const stat=fs.lstatSync(file);if(!stat.isFile()||stat.isSymbolicLink()||stat.size>5000000)throw Error('La clasificación no es un archivo válido.');
-  const stored=JSON.parse(fs.readFileSync(file,'utf8'));if(stored.schemaVersion!==1||!Array.isArray(stored.entries)||stored.entries.length>maxEntries)throw Error('Formato de clasificación no válido.');
-  for(const row of stored.entries)if(validRecord(row))records.set(row.player,row);
+  const original=fs.readFileSync(file),stored=JSON.parse(original);if(![1,2].includes(stored.schemaVersion)||!Array.isArray(stored.entries)||stored.entries.length>maxEntries)throw Error('Formato de clasificación no válido.');
+  if(stored.schemaVersion!==2||stored.season!==season||stored.modelVersion!==modelVersion){const backup=file+'.previous-season-'+hash(original).slice(0,16)+'.json';if(!fs.existsSync(backup))fs.writeFileSync(backup,original,{flag:'wx',mode:0o600});}
+  else for(const row of stored.entries)if(validRecord(row))records.set(row.player,row);
  }catch(error){if(error.code!=='ENOENT')throw error;}
- function validRecord(row){return row&&/^[a-f0-9]{64}$/.test(row.player||'')&&typeof row.name==='string'&&row.name.length<=20&&Number.isSafeInteger(row.score)&&row.score>=0&&row.score<=100000000&&Number.isFinite(row.distance)&&row.distance>=0&&Number.isSafeInteger(row.coins)&&row.coins>=0&&Number.isSafeInteger(row.at);}
- function publicRow(row,index){return {rank:index+1,name:row.name,score:row.score,distance:Math.round(row.distance),coins:row.coins,at:row.at};}
- function ordered(){return [...records.values()].sort((a,b)=>b.score-a.score||a.at-b.at||a.player.localeCompare(b.player));}
- function playerOf(session){if(!/^\d{17,20}$/.test(session?.user?.id||''))throw fail('Conecta Discord para participar en la clasificación global.',401);return hash('kovium-runner:'+session.user.id);}
+ function validRecord(row){return row&&/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(row.player||'')&&Number.isSafeInteger(row.score)&&row.score>=0&&row.score<=100000000&&Number.isFinite(row.distance)&&row.distance>=0&&Number.isSafeInteger(row.coins)&&row.coins>=0&&Number.isSafeInteger(row.at);}
+ function publicRow(row,index){return {rank:index+1,accountId:row.player,name:profileForAccount(row.player)?.name||'Cuenta retirada',score:row.score,distance:Math.round(row.distance),coins:row.coins,at:row.at};}
+ function ordered(){return [...records.values()].filter(row=>profileForAccount(row.player)).sort((a,b)=>b.score-a.score||a.at-b.at||a.player.localeCompare(b.player));}
+ function playerOf(session){if(session?.kind!=='kovium'||!profileForAccount(session.accountId))throw fail('Inicia sesión en tu cuenta Kovium para participar en la clasificación global.',401);return session.accountId;}
  function limit(player,kind,max,period){const time=now(),key=kind+':'+player,current=rates.get(key);if(!current||current.until<=time)rates.set(key,{count:1,until:time+period});else if(++current.count>max)throw fail('Espera un momento antes de volver a enviar una partida.',429);}
  function persist(next){
   fs.mkdirSync(path.dirname(file),{recursive:true});
   if(fs.existsSync(file)&&fs.lstatSync(file).isSymbolicLink())throw Error('La clasificación no es un archivo normal.');
   const temp=file+'.'+crypto.randomBytes(8).toString('hex')+'.tmp';
-  try{fs.writeFileSync(temp,JSON.stringify({schemaVersion:1,entries:[...next.values()]}),{flag:'wx',mode:0o600});fs.renameSync(temp,file);}finally{fs.rmSync(temp,{force:true});}
+  try{fs.writeFileSync(temp,JSON.stringify({schemaVersion:2,season,modelVersion,entries:[...next.values()]}),{flag:'wx',mode:0o600});fs.renameSync(temp,file);}finally{fs.rmSync(temp,{force:true});}
  }
- function get(session){const list=ordered();let own=null;if(session?.user?.id){const id=playerOf(session),index=list.findIndex(row=>row.player===id);if(index>=0)own=publicRow(list[index],index);}return {ok:true,online:true,entries:list.slice(0,50).map(publicRow),personalBest:own};}
+ function get(session){const list=ordered();let own=null;if(session?.kind==='kovium'){const id=playerOf(session),index=list.findIndex(row=>row.player===id);if(index>=0)own=publicRow(list[index],index);}return {ok:true,online:true,rankedReady,season,modelVersion,seasonDescriptor,entries:list.slice(0,50).map(publicRow),personalBest:own};}
  function prune(){const time=now();for(const [key,value]of tickets)if(value.expiresAt<=time)tickets.delete(key);for(const [key,value]of rates)if(value.until<=time)rates.delete(key);}
  function start(session){
   const player=playerOf(session);prune();limit(player,'start',8,60000);
+  if(!rankedReady)throw fail('La temporada global todavía no está configurada.',503);
   if(tickets.size>=5000)throw fail('Hay demasiadas partidas activas. Inténtalo más tarde.',503);
   for(const [key,value]of tickets)if(value.player===player)tickets.delete(key);
   const ticket=crypto.randomBytes(32).toString('base64url'),seed=crypto.randomBytes(4).readUInt32LE(0),issuedAt=now(),expiresAt=issuedAt+35*60000;
-  tickets.set(hash(ticket),{player,seed,issuedAt,expiresAt});return {ok:true,online:true,ticket,seed,expiresAt};
+  tickets.set(hash(ticket),{player,seed,issuedAt,expiresAt,season,modelVersion});return {ok:true,online:true,ticket,seed,expiresAt,season,modelVersion,seasonDescriptor};
  }
  function submit(session,payload){
   const player=playerOf(session);prune();limit(player,'submit',12,60000);
+  if(payload.season!==season||payload.modelVersion!==modelVersion)throw fail('Actualiza Run Kovi, Run para participar en esta temporada.',409);
   if(!/^[A-Za-z0-9_-]{43}$/.test(payload.ticket||''))throw fail('La partida global no es válida. Inicia otra.');
   const key=hash(payload.ticket),ticket=tickets.get(key);
   if(!ticket||ticket.player!==player||ticket.expiresAt<=now())throw fail('La partida global caducó. Inicia otra.',409);
   const run=payload.run||payload;
   if(!Number.isSafeInteger(run.ticks)||run.ticks<1||run.ticks>MAX_TICKS||run.ticks/60*1000>now()-ticket.issuedAt+2500)throw fail('La duración de la partida no es válida.');
   if(!Array.isArray(run.inputs)||run.inputs.length>MAX_INPUTS)throw fail('Los movimientos de la partida no son válidos.');
-  const name=String(payload.nickname||'').trim();if(!/^[\p{L}\p{N}_ .-]{3,20}$/u.test(name))throw fail('Elige un nombre de 3 a 20 letras, números o espacios.');
   let previous=-1;
   for(const input of run.inputs){if(!input||!Number.isSafeInteger(input.tick)||input.tick<0||input.tick>=run.ticks||input.tick<previous||!ACTIONS.has(input.action))throw fail('Los movimientos de la partida no son válidos.');previous=input.tick;}
   tickets.delete(key); // A replay can be redeemed once, including failed simulations.
@@ -63,7 +72,7 @@ function createRunnerLeaderboard({file,now=Date.now,modelFactory,maxEntries=1000
   if(run.score!==undefined&&run.score!==state.score||run.coins!==undefined&&run.coins!==state.coins||run.distance!==undefined&&(!Number.isFinite(run.distance)||Math.abs(run.distance-state.distance)>0.05))throw fail('La puntuación no coincide con los movimientos de la partida.');
   const previousBest=records.get(player),improved=!previousBest||state.score>previousBest.score;
   if(improved){
-   const next=new Map(records);next.set(player,{player,name,score:state.score,distance:state.distance,coins:state.coins,at:now()});
+   const next=new Map(records);next.set(player,{player,score:state.score,distance:state.distance,coins:state.coins,at:now()});
    if(next.size>maxEntries){const retained=[...next.values()].sort((a,b)=>b.score-a.score||a.at-b.at).slice(0,maxEntries);next.clear();for(const row of retained)next.set(row.player,row);}
    persist(next);records=next;
   }
@@ -71,4 +80,4 @@ function createRunnerLeaderboard({file,now=Date.now,modelFactory,maxEntries=1000
  }
  return {get,start,submit,prune};
 }
-module.exports={createRunnerLeaderboard,readRunnerBody,MAX_TICKS,MAX_INPUTS};
+module.exports={createRunnerLeaderboard,verifySeasonDescriptor,readRunnerBody,MAX_TICKS,MAX_INPUTS};
