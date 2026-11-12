@@ -3,6 +3,8 @@ const http=require('http'),fs=require('fs'),path=require('path'),crypto=require(
 const {pipeline}=require('stream/promises');
 const {createCatalogChannel,readCatalogBody}=require('./catalog-channel.cjs');
 const {createDesktopUpdate}=require('./desktop-update.cjs');
+const {createAdminAccess}=require('./admin-access.cjs');
+const {createRunnerLeaderboard,readRunnerBody}=require('./runner-leaderboard.cjs');
 const token=()=>crypto.randomBytes(32).toString('base64url');
 const digest=s=>crypto.createHash('sha256').update(s).digest('hex');
 const challenge=s=>crypto.createHash('sha256').update(s).digest('base64url');
@@ -25,6 +27,8 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
  fs.mkdirSync(packRoot,{recursive:true});fs.mkdirSync(path.dirname(sessionFile),{recursive:true});
  const desktopUpdates=createDesktopUpdate({file:path.join(path.dirname(sessionFile),'desktop-update.json'),publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8')});
  const catalogFile=config.catalogFile||path.join(path.dirname(sessionFile),'public-catalog.json'),catalogChannel=createCatalogChannel({file:catalogFile,publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8')});let catalogCache=null;
+ const adminPublishing=createAdminAccess({file:path.join(path.dirname(sessionFile),'admin-publisher-sessions.json'),passwordHash:config.adminPasswordHash,githubToken:config.publishGitHubToken,signingKeyBase64:config.publishSigningKeyBase64,publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8'),legacyToken:config.adminToken,fetchImpl,now});
+ const runner=createRunnerLeaderboard({file:path.join(path.dirname(sessionFile),'runner-leaderboard.json'),now});
  const oauth=new Map(),handoffs=new Map(),tickets=new Map(),admissions=new Map(),rates=new Map(),activeDownloads=new Map(),tokenRefreshes=new Map();let sessions={};
  const sessionIdleMs=30*86400000,sessionAbsoluteMs=90*86400000;
  try{sessions=JSON.parse(fs.readFileSync(sessionFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw Error('No se pudo leer la base de sesiones.');}
@@ -94,7 +98,7 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
  }
  function json(res,status,value){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'});res.end(JSON.stringify(value));}
  async function body(req){let text='';for await(const chunk of req){text+=chunk;if(Buffer.byteLength(text)>16000)throw Object.assign(Error('Solicitud demasiado grande.'),{status:413});}try{return JSON.parse(text||'{}');}catch{throw Object.assign(Error('JSON no válido.'),{status:400});}}
- function admin(req){if(!config.adminToken||config.adminToken.length<32||!equal(req.headers.authorization||'','Bearer '+config.adminToken))throw Object.assign(Error('Acceso administrativo no autorizado.'),{status:401});}
+ function admin(req){if(adminPublishing.authorize(req))return;if(!config.adminToken||config.adminToken.length<32||!equal(req.headers.authorization||'','Bearer '+config.adminToken))throw Object.assign(Error('Acceso administrativo no autorizado.'),{status:401});}
  function serverAccess(req,projectId){
   const match=/^Bearer ([A-Za-z0-9_-]{32,200})$/.exec(req.headers.authorization||'');let entries=[];
   try{entries=JSON.parse(fs.readFileSync(config.serverKeysFile,'utf8')).servers||[];}catch{}
@@ -115,6 +119,10 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
   try{
    if(req.headers.origin)throw Object.assign(Error('No se permiten peticiones desde páginas web.'),{status:403});
    const url=new URL(req.url,publicURL),ip=req.socket.remoteAddress||'unknown';if(req.method==='GET'&&url.pathname==='/health'){json(res,200,{ok:true});return;}
+   if(await adminPublishing.handle(req,res,url,ip))return;
+   if(req.method==='GET'&&url.pathname==='/v1/runner/leaderboard'){rate(ip,'runner',180);let s;try{s=session(req);}catch(error){if(error.status!==401)throw error;}json(res,200,await runner.get(s));return;}
+   if(req.method==='POST'&&url.pathname==='/v1/runner/start'){rate(ip,'runner',30);json(res,200,await runner.start(session(req)));return;}
+   if(req.method==='POST'&&url.pathname==='/v1/runner/submit'){rate(ip,'runner',30);const s=session(req);json(res,200,await runner.submit(s,await readRunnerBody(req)));return;}
    if(req.method==='GET'&&url.pathname==='/v1/catalog'){
     rate(ip,'catalog',6000);const value=catalogResponse();res.writeHead(200,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store, no-cache, must-revalidate','Pragma':'no-cache','Expires':'0','ETag':'"'+value.revision+'"','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'});res.end(value.body);return;
    }
@@ -197,10 +205,10 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
    json(res,404,{error:'not_found'});
   }catch(e){if(res.headersSent){res.destroy();return;}json(res,e.status||500,{error:e.status?e.message:'El servicio no pudo completar la solicitud.',...(e.status===409?{currentRevision:e.currentRevision||null}:{})});}
  }
- const cleaner=setInterval(()=>{const time=now();for(const map of [oauth,handoffs,tickets,admissions])for(const [id,item]of map)if(item.expiresAt<time)map.delete(id);for(const [ip,item]of rates)if(item.until<time)rates.delete(ip);try{pruneStages();packStorage.sweep();}catch{}},60000);cleaner.unref();
- const server=http.createServer(handler);server.requestTimeout=600000;server.headersTimeout=15000;server.maxHeadersCount=30;
+ const cleaner=setInterval(()=>{const time=now();for(const map of [oauth,handoffs,tickets,admissions])for(const [id,item]of map)if(item.expiresAt<time)map.delete(id);for(const [ip,item]of rates)if(item.until<time)rates.delete(ip);try{pruneStages();packStorage.sweep();adminPublishing.sweep();runner.prune();}catch{}},60000);cleaner.unref();
+ const server=http.createServer(handler);server.requestTimeout=30*60000;server.headersTimeout=15000;server.maxHeadersCount=30;
  server.once('close',()=>clearInterval(cleaner));return server;
 }
-function environment(env=process.env){const base=path.resolve(__dirname,'private');return {publicURL:env.PUBLIC_URL,discordClientId:env.DISCORD_CLIENT_ID,discordClientSecret:env.DISCORD_CLIENT_SECRET,encryptionKey:env.SESSION_ENCRYPTION_KEY,adminToken:env.ADMIN_TOKEN,packRoot:env.PACK_ROOT||path.join(base,'packs'),projectsFile:env.PROJECTS_FILE||path.join(base,'projects.json'),sessionFile:env.SESSION_FILE||path.join(base,'sessions.json'),serverKeysFile:env.SERVER_KEYS_FILE||path.join(base,'server-keys.json'),...(env.PACK_STORAGE_BUDGET_BYTES?{packStorageBudgetBytes:env.PACK_STORAGE_BUDGET_BYTES}:{}),...(env.PACK_MAX_UPLOAD_BYTES?{maxPackBytes:env.PACK_MAX_UPLOAD_BYTES}:{}),...(env.PACK_DISK_RESERVE_BYTES?{packDiskReserveBytes:env.PACK_DISK_RESERVE_BYTES}:{})};}
+function environment(env=process.env){const base=path.resolve(__dirname,'private');return {publicURL:env.PUBLIC_URL,discordClientId:env.DISCORD_CLIENT_ID,discordClientSecret:env.DISCORD_CLIENT_SECRET,encryptionKey:env.SESSION_ENCRYPTION_KEY,adminToken:env.ADMIN_TOKEN,adminPasswordHash:env.ADMIN_PASSWORD_HASH,publishGitHubToken:env.PUBLISH_GITHUB_TOKEN,publishSigningKeyBase64:env.PUBLISH_SIGNING_KEY_PEM_B64,packRoot:env.PACK_ROOT||path.join(base,'packs'),projectsFile:env.PROJECTS_FILE||path.join(base,'projects.json'),sessionFile:env.SESSION_FILE||path.join(base,'sessions.json'),serverKeysFile:env.SERVER_KEYS_FILE||path.join(base,'server-keys.json'),...(env.PACK_STORAGE_BUDGET_BYTES?{packStorageBudgetBytes:env.PACK_STORAGE_BUDGET_BYTES}:{}),...(env.PACK_MAX_UPLOAD_BYTES?{maxPackBytes:env.PACK_MAX_UPLOAD_BYTES}:{}),...(env.PACK_DISK_RESERVE_BYTES?{packDiskReserveBytes:env.PACK_DISK_RESERVE_BYTES}:{})};}
 if(require.main===module){try{const server=createAccessServer(environment());server.listen(Number(process.env.PORT)||8787,process.env.BIND_HOST||'127.0.0.1',()=>console.log('Servicio de cupos listo en el puerto '+server.address().port));}catch(e){console.error(e.message);process.exitCode=1;}}
 module.exports={createAccessServer,createPackStorage,environment,challenge,digest};

@@ -3,6 +3,9 @@
 !server.cjs
 !catalog-channel.cjs
 !desktop-update.cjs
+!admin-access.cjs
+!runner-leaderboard.cjs
+!runner-model.js
 !catalog-public-key.pem
 !launcher-design.js
 !docker-start.cjs
