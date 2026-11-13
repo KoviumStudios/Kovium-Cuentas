@@ -9,6 +9,13 @@
 !public-info.cjs
 !runner-leaderboard.cjs
 !runner-model.js
+!runner-store.cjs
+!runner-continuous.js
+!runner-continuous-service.cjs
+!runner-admin.cjs
+!test-*.cjs
+!test-client/
+!test-client/**
 !catalog-public-key.pem
 !launcher-design.js
 !docker-start.cjs

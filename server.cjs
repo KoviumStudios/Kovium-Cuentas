@@ -5,6 +5,8 @@ const {createCatalogChannel,readCatalogBody}=require('./catalog-channel.cjs');
 const {createDesktopUpdate}=require('./desktop-update.cjs');
 const {createAdminAccess}=require('./admin-access.cjs');
 const {createRunnerLeaderboard,readRunnerBody}=require('./runner-leaderboard.cjs');
+const {createContinuousService}=require('./runner-continuous-service.cjs');
+const {createRunnerAdmin}=require('./runner-admin.cjs');
 const {createKoviumAccounts}=require('./kovium-accounts.cjs');
 const {publicInfo}=require('./public-info.cjs');
 const {isIP}=require('net');
@@ -37,8 +39,10 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
  const seal=value=>{const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',key,iv),ciphertext=Buffer.concat([cipher.update(JSON.stringify(value)),cipher.final()]);return Buffer.concat([iv,cipher.getAuthTag(),ciphertext]).toString('base64');};
  const open=value=>{const b=Buffer.from(value,'base64'),cipher=crypto.createDecipheriv('aes-256-gcm',key,b.subarray(0,12));cipher.setAuthTag(b.subarray(12,28));return JSON.parse(Buffer.concat([cipher.update(b.subarray(28)),cipher.final()]));};
  let runner;
- const accounts=createKoviumAccounts({arcadeForAccount:id=>runner?runner.wallet(id):{coins:0,totalRuns:0},file:config.accountsFile||path.join(path.dirname(sessionFile),'accounts.json'),encryptionKey:config.encryptionKey,publicURL:publicURL.origin,googleClientId:config.googleClientId,googleClientSecret:config.googleClientSecret,fetchImpl,now,...(accountPasswordDerive?{deriveKey:accountPasswordDerive}:{}),verifyDiscord:verifyDiscordForAccount,restoreDiscord:restoreAccountDiscord,discordSessionValid:(cached,accountId,familyId,discordId)=>{const s=sessions[digest(cached.sessionToken||'')];return !!s&&s.expiresAt>now()&&s.accountId===accountId&&s.accountFamilyId===familyId&&s.user.id===discordId;},onDiscordLinked:(accountId,proof)=>{const s=sessions[proof.sourceSessionId];if(s&&s.user.id===proof.id){s.linkedAccountId=accountId;s.credentials=proof.credentials;save();}},revokeDiscord:revokeAccountDiscord});
+ const accounts=createKoviumAccounts({arcadeForAccount:id=>runner?runner.walletV2(id):{coins:0,totalRuns:0,revision:0},file:config.accountsFile||path.join(path.dirname(sessionFile),'accounts.json'),encryptionKey:config.encryptionKey,publicURL:publicURL.origin,googleClientId:config.googleClientId,googleClientSecret:config.googleClientSecret,fetchImpl,now,...(accountPasswordDerive?{deriveKey:accountPasswordDerive}:{}),verifyDiscord:verifyDiscordForAccount,restoreDiscord:restoreAccountDiscord,discordSessionValid:(cached,accountId,familyId,discordId)=>{const s=sessions[digest(cached.sessionToken||'')];return !!s&&s.expiresAt>now()&&s.accountId===accountId&&s.accountFamilyId===familyId&&s.user.id===discordId;},onDiscordLinked:(accountId,proof)=>{const s=sessions[proof.sourceSessionId];if(s&&s.user.id===proof.id){s.linkedAccountId=accountId;s.credentials=proof.credentials;save();}},revokeDiscord:revokeAccountDiscord});
  runner=createRunnerLeaderboard({file:path.join(path.dirname(sessionFile),'runner-leaderboard.json'),now,profileForAccount:id=>accounts.profileById(id),signingKeyBase64:config.publishSigningKeyBase64,publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8')});
+ const continuous=createContinuousService({board:runner,now,signingKeyBase64:config.publishSigningKeyBase64,publicKey:catalogPublicKey||fs.readFileSync(path.join(__dirname,'catalog-public-key.pem'),'utf8')});
+ const runnerAdmin=createRunnerAdmin({board:runner,accounts,now});
  function save(){let fd;try{fd=fs.openSync(sessionFile+'.tmp','w',0o600);fs.writeFileSync(fd,JSON.stringify(sessions));fs.fsyncSync(fd);}finally{if(fd!==undefined)fs.closeSync(fd);}fs.renameSync(sessionFile+'.tmp',sessionFile);}
  function readPolicies(){try{const value=JSON.parse(fs.readFileSync(policiesFile,'utf8'));if(!value.projects||typeof value.projects!=='object'||Array.isArray(value.projects))throw Error();return value;}catch(e){if(e.code==='ENOENT')return {projects:{}};throw Error('No se pudo leer la política de cupos.');}}
  function writePolicies(value){fs.mkdirSync(path.dirname(policiesFile),{recursive:true});fs.writeFileSync(policiesFile+'.tmp',JSON.stringify(value,null,2));fs.renameSync(policiesFile+'.tmp',policiesFile);}
@@ -146,6 +150,20 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
    if(req.headers.origin)throw Object.assign(Error('No se permiten peticiones desde páginas web.'),{status:403});
    const url=new URL(req.url,publicURL);let ip=req.socket.remoteAddress||'unknown';if(config.trustProxy==='railway'){const real=String(req.headers['x-real-ip']||'').trim();if(isIP(real))ip=real;}else if(config.trustProxy===true||config.trustProxy==='1'){const forwarded=String(req.headers['x-forwarded-for']||'').split(',').map(x=>x.trim()),last=forwarded.at(-1);if(isIP(last))ip=last;}if(req.method==='GET'&&url.pathname==='/health'){json(res,200,{ok:true});return;}
    if(publicInfo(req,res,url))return;
+   if(url.pathname.startsWith('/v1/admin/runner/')){
+    rate(ip,'runner-admin',180);let admin=adminPublishing.authorize(req);if(!admin)throw Object.assign(Error('Conecta el Administrador para gestionar perfiles.'),{status:401});
+    const match=url.pathname.match(/^\/v1\/admin\/runner\/profiles(?:\/([a-f0-9-]{36})(?:\/(audit))?)?$/);if(!match)throw Object.assign(Error('Ruta de perfiles no válida.'),{status:404});let result;
+    if(req.method==='GET'&&!match[1])result=runnerAdmin.list({q:url.searchParams.get('q')||'',cursor:url.searchParams.get('cursor')||''});
+    else if(req.method==='GET'&&match[1])result=match[2]?runnerAdmin.audit(match[1],url.searchParams.get('cursor')||''):runnerAdmin.detail(match[1]);
+    else if(req.method==='PATCH'&&match[1]&&!match[2]){const payload=await readRunnerBody(req,4096);admin=adminPublishing.authorize(req);if(!admin)throw Object.assign(Error('La sesión del Administrador caducó.'),{status:401});result=runnerAdmin.adjust(match[1],payload,admin);}
+    else throw Object.assign(Error('Operación de perfiles no disponible.'),{status:404});json(res,200,result);return;
+   }
+   if(url.pathname.startsWith('/v2/runner/')){
+    if(req.method==='GET'&&['/v2/runner/capabilities','/v2/runner/leaderboard'].includes(url.pathname)){rate(ip,'runner-continuous-public',600);json(res,200,url.pathname.endsWith('/capabilities')?continuous.capabilities():continuous.get(accounts.auth(req,true)));return;}
+    if(req.method==='POST'&&['/v2/runner/start','/v2/runner/resume','/v2/runner/checkpoint'].includes(url.pathname)){try{accounts.auth(req);}catch(error){rate(ip,'runner-continuous-public',600);throw error;}rate(ip,'runner-continuous-authenticated',18000);const payload=await readRunnerBody(req,150000),session=accounts.auth(req),action=url.pathname.split('/').at(-1);json(res,200,continuous[action](session,payload));return;}
+    rate(ip,'runner-continuous-public',600);
+    throw Object.assign(Error('Operación de Arcade no disponible.'),{status:404});
+   }
    if(await adminPublishing.handle(req,res,url,ip))return;
    if(await accounts.handle(req,res,url,ip))return;
    if(req.method==='GET'&&url.pathname==='/v1/runner/leaderboard'){rate(ip,'runner',180);json(res,200,await runner.get(accounts.auth(req,true)));return;}
@@ -235,7 +253,7 @@ function createAccessServer(config,{fetchImpl=fetch,now=Date.now,catalogPublicKe
  }
  const cleaner=setInterval(()=>{const time=now();for(const map of [oauth,handoffs,tickets,admissions])for(const [id,item]of map)if(item.expiresAt<time)map.delete(id);for(const [ip,item]of rates)if(item.until<time)rates.delete(ip);try{pruneStages();packStorage.sweep();adminPublishing.sweep();runner.prune();accounts.prune();}catch{}},60000);cleaner.unref();
  const server=http.createServer(handler);server.requestTimeout=30*60000;server.headersTimeout=15000;server.maxHeadersCount=30;
- server.once('close',()=>clearInterval(cleaner));return server;
+ server.once('close',()=>{clearInterval(cleaner);runner.store.close();});return server;
 }
 function environment(env=process.env){const base=path.resolve(__dirname,'private');return {publicURL:env.PUBLIC_URL,discordClientId:env.DISCORD_CLIENT_ID,discordClientSecret:env.DISCORD_CLIENT_SECRET,encryptionKey:env.SESSION_ENCRYPTION_KEY,adminToken:env.ADMIN_TOKEN,adminPasswordHash:env.ADMIN_PASSWORD_HASH,publishGitHubToken:env.PUBLISH_GITHUB_TOKEN,publishSigningKeyBase64:env.PUBLISH_SIGNING_KEY_PEM_B64,googleClientId:env.GOOGLE_CLIENT_ID,googleClientSecret:env.GOOGLE_CLIENT_SECRET,trustProxy:env.TRUST_PROXY||false,accountsFile:env.ACCOUNTS_FILE,packRoot:env.PACK_ROOT||path.join(base,'packs'),projectsFile:env.PROJECTS_FILE||path.join(base,'projects.json'),sessionFile:env.SESSION_FILE||path.join(base,'sessions.json'),serverKeysFile:env.SERVER_KEYS_FILE||path.join(base,'server-keys.json'),...(env.PACK_STORAGE_BUDGET_BYTES?{packStorageBudgetBytes:env.PACK_STORAGE_BUDGET_BYTES}:{}),...(env.PACK_MAX_UPLOAD_BYTES?{maxPackBytes:env.PACK_MAX_UPLOAD_BYTES}:{}),...(env.PACK_DISK_RESERVE_BYTES?{packDiskReserveBytes:env.PACK_DISK_RESERVE_BYTES}:{})};}
 if(require.main===module){try{const server=createAccessServer(environment());server.listen(Number(process.env.PORT)||8787,process.env.BIND_HOST||'127.0.0.1',()=>console.log('Servicio de cupos listo en el puerto '+server.address().port));}catch(e){console.error(e.message);process.exitCode=1;}}
