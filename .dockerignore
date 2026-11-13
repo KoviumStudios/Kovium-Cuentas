@@ -21,3 +21,5 @@
 !docker-start.cjs
 !docker-entrypoint.sh
 !projects.example.json
+
+!runner-star.js
