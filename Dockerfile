@@ -12,7 +12,7 @@ ENV NODE_ENV=production PORT=8787 BIND_HOST=0.0.0.0 \
 
 WORKDIR /app
 RUN apk add --no-cache su-exec && mkdir -p /data/packs && chown node:node /data /data/packs
-COPY --from=tested --chown=node:node /app/server.cjs /app/catalog-channel.cjs /app/desktop-update.cjs /app/admin-access.cjs /app/kovium-accounts.cjs /app/account-skin.cjs /app/public-info.cjs /app/runner-leaderboard.cjs /app/runner-store.cjs /app/runner-continuous-service.cjs /app/runner-admin.cjs /app/runner-model.js /app/runner-continuous.js /app/runner-star.js /app/runner-roofs.js /app/catalog-public-key.pem /app/launcher-design.js /app/docker-start.cjs /app/projects.example.json ./
+COPY --from=tested --chown=node:node /app/server.cjs /app/catalog-channel.cjs /app/desktop-update.cjs /app/admin-access.cjs /app/kovium-accounts.cjs /app/account-skin.cjs /app/public-info.cjs /app/runner-leaderboard.cjs /app/runner-store.cjs /app/runner-continuous-service.cjs /app/runner-admin.cjs /app/runner-model.js /app/runner-continuous.js /app/runner-star.js /app/runner-roofs.js /app/runner-adventure.js /app/runner-roofs-compat.js /app/runner-adventure-service.cjs /app/catalog-public-key.pem /app/launcher-design.js /app/docker-start.cjs /app/projects.example.json ./
 COPY docker-entrypoint.sh /usr/local/bin/kovium-entrypoint
 RUN chmod 0555 /usr/local/bin/kovium-entrypoint
 USER node

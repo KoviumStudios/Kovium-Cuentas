@@ -25,3 +25,8 @@
 !runner-star.js
 
 !runner-roofs.js
+
+!runner-adventure.js
+!runner-roofs-compat.js
+!runner-adventure-service.cjs
+!test-adventure.cjs

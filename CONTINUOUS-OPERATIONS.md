@@ -9,3 +9,11 @@ Lease expiry is an idle authorization boundary, not a duration limit. A checkpoi
 Rollback: first stop writes and preserve a consistent backup of the SQLite database plus its WAL/SHM files, using SQLite backup/checkpoint or a stopped process. Keep the exact original JSON and schema archives. A rollback to the legacy backend can read the retained pre-migration JSON, but would omit all subsequent continuous progress and admin corrections, so it must not be activated as a lossless rollback. Prefer rolling forward a corrected continuous service against the retained SQLite ledger. Never delete/reset the database to make a deployment start. Account schema/provider credentials are independent and are not reverted. No rollback procedure here is executed automatically.
 
 The first continuous deployment cannot reconstruct v1 tickets that an older process kept only in RAM. V1 tickets issued after this version are durable. Changes to the canonical physics, registered engine or signed compatibility mapping require an explicit review; this release does not reset scores or change the legacy physics file.
+
+## Arcade 1.10.0
+
+Engine 2086eb4190d73546603fd4187c9c2cf2bc0a6fb8da9140b4b9505358e4d50d10 adds verified adventure runs. Keep classic, star and roof engines registered; saved runs from older releases finish using their original engine.
+
+The same SQLite transaction now persists arcadeProfiles, arcadeRecords and arcadeGhosts alongside checkpoints and wallet deltas. Do not replace this backend with an older build that does not recognize these collections. Back up the SQLite database with its WAL consistently before migration; never copy only a live database file.
+
+Daily seeds and boundaries use UTC. Weekly boards start Monday, monthly boards use calendar months, and lifetime scores remain unchanged. A run is attributed to its start date; rewards are idempotent. Purchases have server-defined prices and change cosmetics only. Ghost positions come from replaying verified inputs and are compacted to at most 256 samples per record.
