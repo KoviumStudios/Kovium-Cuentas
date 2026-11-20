@@ -491,7 +491,7 @@
  function object(v){return v&&typeof v==='object'&&!Array.isArray(v);}
  function sanitize(value){
   if(!object(value)||value.elements!==undefined&&!object(value.elements)||value.theme!==undefined&&!object(value.theme))throw Error('El diseño del launcher no es válido.');
-  if(Object.keys(value).some(k=>!['elements','theme'].includes(k)))throw Error('Propiedad de diseño no permitida.');
+  if(Object.keys(value).some(k=>!['elements','theme','history'].includes(k)))throw Error('Propiedad de diseño no permitida.');
   const elements={};for(const [id,e]of Object.entries(value.elements||{})){
    if(!Object.hasOwn(definitions,id)||!object(e))throw Error('Elemento del launcher no permitido.');const spec=definitions[id],out={};
    for(const [key,v]of Object.entries(e)){
@@ -503,7 +503,9 @@
    }elements[id]=out;
   }
   const theme={};for(const [key,v]of Object.entries(value.theme||{})){if(!['accent','surface','background','text','muted'].includes(key)||!color(v))throw Error('Tema del launcher no válido.');theme[key]=v;}
-  return {elements,theme};
+  let history;
+  if(value.history!==undefined){if(!Array.isArray(value.history)||value.history.length>100)throw Error('El historial admite hasta 100 eventos.');const seen=new Set();history=value.history.map(e=>{if(!object(e)||typeof e.id!=='string'||!/^[-a-z0-9]{1,80}$/.test(e.id)||seen.has(e.id))throw Error('Evento no válido.');seen.add(e.id);const out={id:e.id};for(const [key,max]of [['title',120],['description',4000],['image',2000],['video',2000]]){const v=e[key]||'';if(typeof v!=='string'||v.length>max)throw Error('Campo del historial no válido.');if((key==='image'||key==='video')&&v){let u;try{u=new URL(v);}catch{throw Error('Usa enlaces HTTPS.');}if(u.protocol!=='https:'||u.username||u.password||u.hash||/^(localhost|127\.|10\.|192\.168\.|169\.254\.|\[)/i.test(u.hostname)||u.hostname.endsWith('.local'))throw Error('Usa un enlace HTTPS público.');}out[key]=v;}if(!out.title.trim())throw Error('El evento necesita un título.');return out;});}
+  return {elements,theme,...(history?{history}:{})};
  }
  const records=new WeakMap(),themes=new WeakMap();
  const styleKeys=['transform','width','height','fontSize','color','backgroundColor','borderRadius','objectFit','maxWidth','backgroundImage','backgroundSize','backgroundPosition','whiteSpace'];
